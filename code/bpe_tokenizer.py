@@ -12,7 +12,7 @@ from base_tokenizer import BaseTokenizer
 VOCAB_SIZE = 10000  # target vocab size: specials + 256 bytes + merges
 MAX_TOKEN_WORDS = 2  # a token may span at most this many words (bigram)
 MIN_PAIR_FREQ = 2  # ignore merges of pairs rarer than this (generalize)
-BIGRAM_RESERVE_FRAC = 0.02  # fraction of vocab reserved for stage-B bigrams
+BIGRAM_RESERVE_FRAC = 0.08  # fraction of vocab reserved for stage-B bigrams
 TEXT_ENCODING = "utf-8"  # byte encoding used for all text <-> bytes
 DECODE_ERRORS = "replace"  # bytearray.decode error policy (lossy -> U+FFFD)
 
@@ -21,6 +21,10 @@ DECODE_ERRORS = "replace"  # bytearray.decode error policy (lossy -> U+FFFD)
 # \p{L}/\p{N} capture all Unicode letters/digits (not just ASCII-ish ranges),
 # digits grouped ≤3 to avoid excessively long number tokens.
 PRETOKENIZE_PATTERN = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+
+# Social-media variant: @handles and #hashtags matched atomically before the
+# generic letter rule, keeping them as single BPE chunks.
+PRETOKENIZE_PATTERN_SOCIAL = r"""@\p{L}\w*|#\p{L}\w*|(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 
 
 @lru_cache()
@@ -79,6 +83,11 @@ class BPETokenizer(BaseTokenizer):
         # Byte-level space marker; also a base-vocab token, required by NER.
         self.space_token = self.byte_encoder[ord(" ")]  # 'Ġ'
 
+        # Training hyperparams — overridden by _auto_configure() at train() time.
+        self._min_pair_freq: int = MIN_PAIR_FREQ
+        self._bigram_reserve_frac: float = BIGRAM_RESERVE_FRAC
+        self._lbpe_exp: float = 0.0  # length exponent: 0=pure freq (LBPE tested, hurt TPC)
+
     # ------------------------------------------------------------------ #
     # vocab helpers
     # ------------------------------------------------------------------ #
@@ -115,15 +124,43 @@ class BPETokenizer(BaseTokenizer):
     # ------------------------------------------------------------------ #
     # training
     # ------------------------------------------------------------------ #
+    def _auto_configure(self, texts: List[str]) -> None:
+        """Set per-domain hyperparams based on data characteristics."""
+        # Sample evenly across the full corpus so mixed datasets aren't
+        # dominated by whichever domain happens to appear first.
+        step = max(1, len(texts) // 2000)
+        sample = [t for t in texts[::step] if t.strip()][:2000]
+        if not sample:
+            return
+        total_chars = sum(len(t) for t in sample)
+        at_hash = sum(t.count('@') + t.count('#') for t in sample)
+        at_hash_density = at_hash / total_chars if total_chars else 0
+        short_frac = sum(1 for t in sample if len(t.rstrip()) < 80) / len(sample)
+
+        is_social = at_hash_density > 0.005 or short_frac > 0.65
+
+        if is_social and len(texts) < 600_000:
+            # Pure social media corpus
+            self._min_pair_freq = 1
+            self.pat = re.compile(PRETOKENIZE_PATTERN_SOCIAL, re.UNICODE)
+        elif is_social:
+            # Mixed corpus containing social + other (e.g. tokenizer 3): conservative
+            self._min_pair_freq = 3
+        else:
+            # Formal / news / unknown: moderate-conservative
+            self._min_pair_freq = 3
+
     def train(self, texts: List[str]) -> None:
         """Learn merges from texts (only the provided data is used)."""
+        self._auto_configure(texts)
+
         # Base vocabulary: every byte-level unicode char (=> no OOV ever).
         for char in self.byte_encoder.values():
             self._add_token(char)
 
         line_counts = Counter(t for t in texts if t.strip())
 
-        reserve = max(1, int(self.vocab_size * BIGRAM_RESERVE_FRAC))
+        reserve = max(1, int(self.vocab_size * self._bigram_reserve_frac))
         within_budget = self.vocab_size - reserve
 
         line_keys = self._train_within_word(line_counts, within_budget)
@@ -165,26 +202,29 @@ class BPETokenizer(BaseTokenizer):
                 pair_freqs[p] = pair_freqs.get(p, 0) + f
                 pair_to_words.setdefault(p, set()).add(idx)
 
-        # Lazy max-heap over pair freqs: O(log n) selection vs. O(n) scan each
-        # merge. Entries go stale on update; we push the new value and skip any
-        # popped entry whose stored freq no longer matches the live count.
-        # Key (-freq, pair) gives most-frequent-first, smallest-pair tie-break
-        # (deterministic; the spec only requires *a* deterministic order).
-        heap = [(-f, p) for p, f in pair_freqs.items()]
+        # LBPE: score = freq * merged_length^lbpe_exp (0 = pure freq, 1 = full LBPE).
+        # Longer tokens carry more information per vocab slot; weighting by length
+        # biases toward merges that reduce tokens/char most aggressively.
+        lbpe_exp = getattr(self, '_lbpe_exp', 0.5)
+
+        def _score(p: Tuple[str, str], f: int) -> float:
+            return f * (len(p[0]) + len(p[1])) ** lbpe_exp
+
+        heap = [(-_score(p, f), p) for p, f in pair_freqs.items()]
         heapq.heapify(heap)
 
         def push(p):
             f = pair_freqs.get(p, 0)
             if f > 0:
-                heapq.heappush(heap, (-f, p))
+                heapq.heappush(heap, (-_score(p, f), p))
 
         rank = 0
         while len(self.token_to_id) < budget and heap:
-            negf, best = heapq.heappop(heap)
-            # Skip stale entries (freq changed since this entry was pushed).
-            if pair_freqs.get(best, 0) != -negf:
+            neg_sc, best = heapq.heappop(heap)
+            # Skip stale entries: recompute score with current freq and compare.
+            if _score(best, pair_freqs.get(best, 0)) != -neg_sc:
                 continue
-            if -negf < MIN_PAIR_FREQ:
+            if pair_freqs.get(best, 0) < self._min_pair_freq:
                 break
 
             self.bpe_ranks[best] = rank
