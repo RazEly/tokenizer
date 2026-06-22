@@ -1,0 +1,25 @@
+[project]
+name = "for-students"
+version = "0.1.0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=2.4.6",
+    "regex>=2026.5.9",
+    "torch>=2.12.0",
+    "tqdm>=4.68.1",
+]
+
+# The course GPUs are Tesla M60 (Maxwell, sm_52) behind driver 535 (CUDA 12.2).
+# The default PyPI torch wheel bundles CUDA 13, which dropped Maxwell and needs a
+# newer driver, so torch.cuda.is_available() is False and train_ner_model.py
+# silently runs on CPU. Pull torch from PyTorch's CUDA 12.6 index instead: cu126
+# runs on the 535 driver via minor-version compatibility and still supports
+# Maxwell. Same torch version (2.12.0). If torch 2.12 no longer ships sm_50
+# kernels (check `torch.cuda.get_arch_list()`), drop to cu124/torch 2.6.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
