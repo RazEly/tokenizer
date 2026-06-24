@@ -87,6 +87,7 @@ class BPETokenizer(BaseTokenizer):
         self._min_pair_freq: int = MIN_PAIR_FREQ
         self._bigram_reserve_frac: float = BIGRAM_RESERVE_FRAC
         self._lbpe_exp: float = 0.0  # length exponent: 0=pure freq (LBPE tested, hurt TPC)
+        self._min_bigram_freq: int = 1  # stage-B: skip bigrams rarer than this
 
     # ------------------------------------------------------------------ #
     # vocab helpers
@@ -310,6 +311,16 @@ class BPETokenizer(BaseTokenizer):
         for (a, b), freq in bigram_freqs.most_common():
             if len(self.token_to_id) >= self.vocab_size:
                 break
+            if freq < self._min_bigram_freq:
+                break  # most_common() is sorted; all remaining are also below threshold
+            merged = a + b
+            self.bigram_merges[(a, b)] = merged
+            self.bigram_stats[merged] = freq
+            self._add_token(merged)
+
+        # Guarantee ≥1 bigram even if all candidates fell below min_bigram_freq.
+        if not self.bigram_merges and bigram_freqs:
+            (a, b), freq = bigram_freqs.most_common(1)[0]
             merged = a + b
             self.bigram_merges[(a, b)] = merged
             self.bigram_stats[merged] = freq
