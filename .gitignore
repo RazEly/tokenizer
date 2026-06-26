@@ -1,3 +1,4 @@
 data/
 trained_tokenizers/
-
+__pycache__/
+.venv
