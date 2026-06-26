@@ -9,12 +9,11 @@ from base_tokenizer import BaseTokenizer
 # --------------------------------------------------------------------------- #
 # Hyperparameters
 # --------------------------------------------------------------------------- #
-VOCAB_SIZE = 10000  # target vocab size: specials + 256 bytes + merges
+VOCAB_SIZE = 5000   # target vocab size: specials + 256 bytes + merges
 MAX_TOKEN_WORDS = 2  # a token may span at most this many words (bigram)
 MIN_PAIR_FREQ = 2  # ignore merges of pairs rarer than this (generalize)
 BIGRAM_RESERVE_FRAC = 0.08  # fraction of vocab reserved for stage-B bigrams
 TEXT_ENCODING = "utf-8"  # byte encoding used for all text <-> bytes
-DECODE_ERRORS = "replace"  # bytearray.decode error policy (lossy -> U+FFFD)
 
 # cl100k-style pre-tokenization pattern (requires `regex` for \p{} Unicode
 # properties). Improvements over GPT-2 pattern: case-insensitive contractions,
@@ -25,6 +24,10 @@ PRETOKENIZE_PATTERN = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|
 # Social-media variant: @handles and #hashtags matched atomically before the
 # generic letter rule, keeping them as single BPE chunks.
 PRETOKENIZE_PATTERN_SOCIAL = r"""@\p{L}\w*|#\p{L}\w*|(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
+
+# @handle matcher — used by the domain-3 (mixed) flow to strip Twitter mentions
+# from the combined corpus before training (they don't transfer to the hidden domain).
+HANDLE_RE = re.compile(r"@\w+")
 
 
 @lru_cache()
@@ -86,8 +89,8 @@ class BPETokenizer(BaseTokenizer):
         # Training hyperparams — overridden by _auto_configure() at train() time.
         self._min_pair_freq: int = MIN_PAIR_FREQ
         self._bigram_reserve_frac: float = BIGRAM_RESERVE_FRAC
-        self._lbpe_exp: float = 0.0  # length exponent: 0=pure freq (LBPE tested, hurt TPC)
-        self._min_bigram_freq: int = 1  # stage-B: skip bigrams rarer than this
+        self._lbpe_exp: float = 0.0
+        self._min_bigram_freq: int = 8  # tuned: domain 1 & 2 both optimal at 8
 
     # ------------------------------------------------------------------ #
     # vocab helpers
@@ -125,35 +128,50 @@ class BPETokenizer(BaseTokenizer):
     # ------------------------------------------------------------------ #
     # training
     # ------------------------------------------------------------------ #
-    def _auto_configure(self, texts: List[str]) -> None:
-        """Set per-domain hyperparams based on data characteristics."""
-        # Sample evenly across the full corpus so mixed datasets aren't
-        # dominated by whichever domain happens to appear first.
-        step = max(1, len(texts) // 2000)
-        sample = [t for t in texts[::step] if t.strip()][:2000]
-        if not sample:
-            return
-        total_chars = sum(len(t) for t in sample)
-        at_hash = sum(t.count('@') + t.count('#') for t in sample)
-        at_hash_density = at_hash / total_chars if total_chars else 0
-        short_frac = sum(1 for t in sample if len(t.rstrip()) < 80) / len(sample)
+    def _auto_configure(self, texts: List[str]) -> str:
+        """Apply per-domain hyperparams and return the detected mode.
 
-        is_social = at_hash_density > 0.005 or short_frac > 0.65
+        Three cases (params from Optuna composite search; 'mixed' pending tuning):
+          - 'mixed'  : combined domain_1+domain_2 corpus for the hidden domain-3
+                       tokenizer. Only the union exceeds 1.4M lines, so size is the
+                       discriminator (at_frac alone can't separate it from domain 1).
+                       Generalist params + standard pattern; train() also strips
+                       @handles — Twitter noise that won't transfer to the hidden domain.
+          - 'social' : domain 1 (Twitter-like), ~0.44 of lines start with @handle.
+          - 'formal' : domain 2 (news/long-form), ~0 @handles.
+        """
+        n        = len(texts) or 1
+        at_frac  = sum(1 for t in texts if t.lstrip().startswith("@")) / n
 
-        if is_social and len(texts) < 600_000:
-            # Pure social media corpus
-            self._min_pair_freq = 1
+        if n > 1_400_000:
+            # Domain 3 (hidden): combined corpus. Generalist params (placeholder —
+            # retune via cross-domain proxy on dev_1 + dev_2).
+            self._min_pair_freq       = 5
+            self._bigram_reserve_frac = 0.02
+            self._lbpe_exp            = 1.0
+            return "mixed"
+        if at_frac > 0.05:
+            # Domain 1 (social/Twitter)
+            self._min_pair_freq       = 9
+            self._bigram_reserve_frac = 0.0068
+            self._lbpe_exp            = 1.4908
             self.pat = re.compile(PRETOKENIZE_PATTERN_SOCIAL, re.UNICODE)
-        elif is_social:
-            # Mixed corpus containing social + other (e.g. tokenizer 3): conservative
-            self._min_pair_freq = 3
-        else:
-            # Formal / news / unknown: moderate-conservative
-            self._min_pair_freq = 3
+            return "social"
+        # Domain 2 (formal/news)
+        self._min_pair_freq       = 4
+        self._bigram_reserve_frac = 0.0909
+        self._lbpe_exp            = 0.7771
+        return "formal"
 
     def train(self, texts: List[str]) -> None:
         """Learn merges from texts (only the provided data is used)."""
-        self._auto_configure(texts)
+        mode = self._auto_configure(texts)
+
+        # Domain-3 flow: strip @handles from the combined corpus before training.
+        # ~99.6% of @-tokens are non-entities in the NER data; the unknown eval
+        # domain is unlikely to be Twitter, so handle merges waste vocab budget.
+        if mode == "mixed":
+            texts = [HANDLE_RE.sub("", t) for t in texts]
 
         # Base vocabulary: every byte-level unicode char (=> no OOV ever).
         for char in self.byte_encoder.values():
@@ -206,7 +224,7 @@ class BPETokenizer(BaseTokenizer):
         # LBPE: score = freq * merged_length^lbpe_exp (0 = pure freq, 1 = full LBPE).
         # Longer tokens carry more information per vocab slot; weighting by length
         # biases toward merges that reduce tokens/char most aggressively.
-        lbpe_exp = getattr(self, '_lbpe_exp', 0.5)
+        lbpe_exp = getattr(self, "_lbpe_exp", 0.5)
 
         def _score(p: Tuple[str, str], f: int) -> float:
             return f * (len(p[0]) + len(p[1])) ** lbpe_exp
@@ -440,7 +458,7 @@ class BPETokenizer(BaseTokenizer):
             chars.append(token)
         text = "".join(chars)
         data = bytearray(self.byte_decoder[c] for c in text)
-        return data.decode(TEXT_ENCODING, errors=DECODE_ERRORS)
+        return data.decode(TEXT_ENCODING, errors="replace")
 
     def encode_with_offsets(self, text: str) -> Tuple[List[int], List[Tuple[int, int]]]:
         """Encode text and return (token_ids, char_offsets).

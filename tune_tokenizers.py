@@ -6,9 +6,16 @@ Uses TPE (Tree-structured Parzen Estimator) to search a continuous space more
 efficiently than grid search. Optimizes F1 as the Optuna objective; composite
 score (F1 + speed + time) computed post-hoc across all completed trials.
 
+Domain 3 is the *hidden* eval domain: it can't be tuned directly (no text, no
+labels), so it trains on the combined domain_1+domain_2 corpus and is scored on
+the MEAN F1 across both dev sets — cross-domain transfer as a proxy for the
+unknown domain. The `strip_handles` hyperparameter (drop @mentions before
+training) is searched so the composite reveals whether stripping actually helps.
+
 Usage:
-    uv run python tune_tokenizers.py                         # both domains, 30 trials each
-    uv run python tune_tokenizers.py --domain 1 --n_trials 15 --tune_epochs 5
+    uv run python tune_tokenizers.py                         # domains 1 & 2, 30 trials each
+    uv run python tune_tokenizers.py --domain 3 --n_trials 15 --tune_epochs 5
+    uv run python tune_tokenizers.py --domain all            # domains 1, 2, and 3
     uv run python tune_tokenizers.py --f1_weight 0.8 --speed_weight 0.1 --time_weight 0.1
     uv run python tune_tokenizers.py --sampler random        # random search baseline
 
@@ -38,7 +45,12 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 sys.path.insert(0, str(Path(__file__).parent / "code"))
 
-from bpe_tokenizer import BPETokenizer, PRETOKENIZE_PATTERN, PRETOKENIZE_PATTERN_SOCIAL
+from bpe_tokenizer import (
+    BPETokenizer,
+    HANDLE_RE,
+    PRETOKENIZE_PATTERN,
+    PRETOKENIZE_PATTERN_SOCIAL,
+)
 from train_ner_model import (
     NERDataset,
     NERModel,
@@ -55,16 +67,28 @@ DEFAULT_N_TRIALS    = 30
 DEFAULT_TUNE_EPOCHS = 8    # fewer than prod (20); captures peak F1 region
 SPEED_SAMPLE_CHARS  = 50_000
 
+# Unified schema: train_texts = corpus file(s) concatenated for tokenizer training;
+# ner_pairs = (train, dev) tagged-file pairs the NER model is scored on. Domain 3
+# trains on the combined corpus and is scored on BOTH dev sets (cross-domain proxy
+# for the hidden eval domain — we can't see it, so transfer across the two known
+# domains is the best available signal).
 DOMAINS = {
     1: {
-        "train_text": "data/domain_1_train.txt",
-        "ner_train":  "data/ner_data/train_1_binary.tagged",
-        "ner_dev":    "data/ner_data/dev_1_binary.tagged",
+        "train_texts": ["data/domain_1_train.txt"],
+        "ner_pairs":   [("data/ner_data/train_1_binary.tagged",
+                         "data/ner_data/dev_1_binary.tagged")],
     },
     2: {
-        "train_text": "data/domain_2_train.txt",
-        "ner_train":  "data/ner_data/train_2_binary.tagged",
-        "ner_dev":    "data/ner_data/dev_2_binary.tagged",
+        "train_texts": ["data/domain_2_train.txt"],
+        "ner_pairs":   [("data/ner_data/train_2_binary.tagged",
+                         "data/ner_data/dev_2_binary.tagged")],
+    },
+    3: {
+        "train_texts": ["data/domain_1_train.txt", "data/domain_2_train.txt"],
+        "ner_pairs":   [("data/ner_data/train_1_binary.tagged",
+                         "data/ner_data/dev_1_binary.tagged"),
+                        ("data/ner_data/train_2_binary.tagged",
+                         "data/ner_data/dev_2_binary.tagged")],
     },
 }
 
@@ -186,30 +210,43 @@ def make_objective(train_texts, cfg, tune_epochs, device):
             "pretok_pattern": trial.suggest_categorical(
                 "pretok_pattern", ["auto", "standard", "social"]
             ),
+            # Strip @handles from the training corpus? Searched so the composite
+            # tells us whether handle-stripping (the domain-3 flow) actually helps.
+            "strip_handles": trial.suggest_categorical("strip_handles", [True, False]),
         }
 
         print(f"\n  Trial {trial.number}: {params}")
 
-        tok = make_tokenizer(params, train_texts)
+        # @handle stripping is a training-corpus transform (encode() is unchanged).
+        texts = train_texts
+        if params["strip_handles"]:
+            texts = [HANDLE_RE.sub("", t) for t in train_texts]
+
+        tok = make_tokenizer(params, texts)
         t0  = time.perf_counter()
-        tok.train(train_texts)
+        tok.train(texts)
         tok_time = time.perf_counter() - t0
         print(f"  tokenizer: {tok_time:.1f}s  vocab={tok.get_vocab_size():,}  bigrams={len(tok.bigram_merges)}")
 
-        speed = measure_speed(tok, train_texts)
+        speed = measure_speed(tok, texts)
         print(f"  speed: {speed:,.0f} tok/s")
 
-        f1, ner_time = train_and_evaluate_ner(
-            tok, cfg["ner_train"], cfg["ner_dev"], tune_epochs, device
-        )
+        # Score NER on every (train, dev) pair; combined F1 = mean across domains.
+        f1s, ner_time = [], 0.0
+        for ner_train, ner_dev in cfg["ner_pairs"]:
+            f1_i, t_i = train_and_evaluate_ner(tok, ner_train, ner_dev, tune_epochs, device)
+            f1s.append(f1_i)
+            ner_time += t_i
+        f1 = sum(f1s) / len(f1s)
         total_time = tok_time + ner_time
-        print(f"  best F1: {f1:.4f}  total: {total_time:.1f}s")
+        print(f"  F1 per domain: {[f'{x:.4f}' for x in f1s]}  mean={f1:.4f}  total: {total_time:.1f}s")
 
-        trial.set_user_attr("speed",      speed)
-        trial.set_user_attr("total_time", total_time)
-        trial.set_user_attr("n_bigrams",  len(tok.bigram_merges))
+        trial.set_user_attr("speed",        speed)
+        trial.set_user_attr("total_time",   total_time)
+        trial.set_user_attr("n_bigrams",    len(tok.bigram_merges))
+        trial.set_user_attr("f1_per_domain", f1s)
 
-        return f1  # Optuna maximizes this; composite computed post-hoc
+        return f1  # Optuna maximizes mean F1; composite computed post-hoc
 
     return objective
 
@@ -257,8 +294,10 @@ def tune_domain(domain_id, cfg, weights, n_trials, tune_epochs, sampler_name, ou
     print(f"  Domain {domain_id}  |  {n_trials} trials  |  {tune_epochs} NER epochs/trial")
     print(f"{'='*62}")
 
-    train_texts = Path(cfg["train_text"]).read_text(encoding="utf-8").splitlines()
-    print(f"  Corpus: {len(train_texts):,} lines")
+    train_texts = []
+    for p in cfg["train_texts"]:
+        train_texts.extend(Path(p).read_text(encoding="utf-8").splitlines())
+    print(f"  Corpus: {len(train_texts):,} lines from {len(cfg['train_texts'])} file(s)")
 
     if sampler_name == "random":
         sampler = optuna.samplers.RandomSampler()
@@ -293,6 +332,7 @@ def tune_domain(domain_id, cfg, weights, n_trials, tune_epochs, sampler_name, ou
             "trial_number":         trial.number,
             "params":               trial.params,
             "f1":                   trial.value,
+            "f1_per_domain":        trial.user_attrs["f1_per_domain"],
             "speed_toks_per_sec":   trial.user_attrs["speed"],
             "total_train_time_sec": trial.user_attrs["total_time"],
             "n_bigrams":            trial.user_attrs["n_bigrams"],
@@ -319,6 +359,7 @@ def tune_domain(domain_id, cfg, weights, n_trials, tune_epochs, sampler_name, ou
             **best_trial.params,
             "scores": {
                 "f1":                   best_trial.value,
+                "f1_per_domain":        best_trial.user_attrs["f1_per_domain"],
                 "speed_toks_per_sec":   best_trial.user_attrs["speed"],
                 "total_train_time_sec": best_trial.user_attrs["total_time"],
             },
@@ -338,7 +379,7 @@ def main():
         description="Optuna hyperparameter search for BPE tokenizer",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--domain",       choices=["1", "2", "both"], default="both")
+    parser.add_argument("--domain",       choices=["1", "2", "3", "both", "all"], default="both")
     parser.add_argument("--output_dir",   default="tuning_results")
     parser.add_argument("--n_trials",     type=int, default=DEFAULT_N_TRIALS,
                         help="Optuna trials per domain")
@@ -360,7 +401,12 @@ def main():
     print(f"Sampler:  {args.sampler.upper()}  |  trials: {args.n_trials}/domain  |  NER epochs: {args.tune_epochs}")
     print(f"Weights:  F1={weights['f1']}  speed={weights['speed']}  time={weights['time']}")
 
-    domains = [1, 2] if args.domain == "both" else [int(args.domain)]
+    if args.domain == "both":
+        domains = [1, 2]
+    elif args.domain == "all":
+        domains = [1, 2, 3]
+    else:
+        domains = [int(args.domain)]
     for d in domains:
         tune_domain(
             d, DOMAINS[d], weights,
