@@ -13,13 +13,13 @@ unknown domain. The `strip_handles` hyperparameter (drop @mentions before
 training) is searched so the composite reveals whether stripping actually helps.
 
 Usage:
-    uv run python tune_tokenizers.py                         # domains 1 & 2, 30 trials each
+    uv run python tune_tokenizers.py                         # all 3 domains, 30 trials each (90 total)
+    uv run python tune_tokenizers.py --domain both           # domains 1 & 2 only
     uv run python tune_tokenizers.py --domain 3 --n_trials 15 --tune_epochs 5
-    uv run python tune_tokenizers.py --domain all            # domains 1, 2, and 3
     uv run python tune_tokenizers.py --f1_weight 0.8 --speed_weight 0.1 --time_weight 0.1
     uv run python tune_tokenizers.py --sampler random        # random search baseline
 
-Estimated runtime (GPU): ~5 min/trial × 30 trials × 2 domains ≈ 5 hours.
+Estimated runtime (GPU): ~5 min/trial × 30 trials × 3 domains ≈ 7.5 hours.
 Use --n_trials 15 --tune_epochs 5 for a ~1-hour exploratory pass.
 
 Results saved to:
@@ -35,7 +35,6 @@ import time
 from pathlib import Path
 
 import optuna
-import regex as re
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -45,12 +44,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 sys.path.insert(0, str(Path(__file__).parent / "code"))
 
-from bpe_tokenizer import (
-    BPETokenizer,
-    HANDLE_RE,
-    PRETOKENIZE_PATTERN,
-    PRETOKENIZE_PATTERN_SOCIAL,
-)
+from bpe_tokenizer import BPETokenizer, HANDLE_RE
 from train_ner_model import (
     NERDataset,
     NERModel,
@@ -95,36 +89,13 @@ DOMAINS = {
 
 # ── Tokenizer factory ─────────────────────────────────────────────────────── #
 
-def _is_social(texts):
-    step   = max(1, len(texts) // 2000)
-    sample = [t for t in texts[::step] if t.strip()][:2000]
-    if not sample:
-        return False
-    total_chars = sum(len(t) for t in sample)
-    at_hash     = sum(t.count("@") + t.count("#") for t in sample)
-    short_frac  = sum(1 for t in sample if len(t.rstrip()) < 80) / len(sample)
-    return (at_hash / total_chars > 0.005 if total_chars else False) or short_frac > 0.65
-
-
 def make_tokenizer(params, texts):
-    """
-    Build BPETokenizer with explicit params, bypassing _auto_configure.
-    pretok_pattern: "auto" (detect from corpus), "social", or "standard".
-    """
+    """Build BPETokenizer with explicit params, bypassing _auto_configure."""
     tok = BPETokenizer(vocab_size=params["vocab_size"])
     tok._bigram_reserve_frac = params["bigram_reserve_frac"]
     tok._lbpe_exp             = params["lbpe_exp"]
     tok._min_pair_freq        = params["min_pair_freq"]
     tok._min_bigram_freq      = params["min_bigram_freq"]
-
-    pat = params["pretok_pattern"]
-    if pat == "social":
-        tok.pat = re.compile(PRETOKENIZE_PATTERN_SOCIAL, re.UNICODE)
-    elif pat == "standard":
-        tok.pat = re.compile(PRETOKENIZE_PATTERN, re.UNICODE)
-    else:  # "auto"
-        if _is_social(texts):
-            tok.pat = re.compile(PRETOKENIZE_PATTERN_SOCIAL, re.UNICODE)
 
     # Instance-dict lookup beats class method; plain functions are not descriptors
     # so 'self' is not injected — _auto_configure(texts) calls lambda(texts).
@@ -207,9 +178,6 @@ def make_objective(train_texts, cfg, tune_epochs, device):
             "min_pair_freq": trial.suggest_int("min_pair_freq", 1, 10),
             # Higher ceiling: aggressively filter rare cross-word tokens for NER.
             "min_bigram_freq": trial.suggest_int("min_bigram_freq", 1, 20),
-            "pretok_pattern": trial.suggest_categorical(
-                "pretok_pattern", ["auto", "standard", "social"]
-            ),
             # Strip @handles from the training corpus? Searched so the composite
             # tells us whether handle-stripping (the domain-3 flow) actually helps.
             "strip_handles": trial.suggest_categorical("strip_handles", [True, False]),
@@ -379,7 +347,7 @@ def main():
         description="Optuna hyperparameter search for BPE tokenizer",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--domain",       choices=["1", "2", "3", "both", "all"], default="both")
+    parser.add_argument("--domain",       choices=["1", "2", "3", "both", "all"], default="all")
     parser.add_argument("--output_dir",   default="tuning_results")
     parser.add_argument("--n_trials",     type=int, default=DEFAULT_N_TRIALS,
                         help="Optuna trials per domain")

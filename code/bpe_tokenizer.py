@@ -13,8 +13,6 @@ TEXT_ENCODING = "utf-8"
 
 PRETOKENIZE_PATTERN = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 
-PRETOKENIZE_PATTERN_SOCIAL = r"""@\p{L}\w*|#\p{L}\w*|(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
-
 # @handle matcher — domain-3 strips mentions before training
 HANDLE_RE = re.compile(r"@\w+")
 
@@ -107,13 +105,11 @@ class BPETokenizer(BaseTokenizer):
             self._bigram_reserve_frac = 0.0030
             self._lbpe_exp = 0.8196
             self._min_bigram_freq = 18
-            self.pat = re.compile(PRETOKENIZE_PATTERN_SOCIAL, re.UNICODE)
             return "mixed"
         if at_frac > 0.05:
             self._min_pair_freq = 9
             self._bigram_reserve_frac = 0.0068
             self._lbpe_exp = 1.4908
-            self.pat = re.compile(PRETOKENIZE_PATTERN_SOCIAL, re.UNICODE)
             return "social"
         # Domain 2 (formal/news)
         self._min_pair_freq = 4
