@@ -63,7 +63,8 @@ class BPETokenizer(BaseTokenizer):
         self._min_pair_freq: int = MIN_PAIR_FREQ
         self._bigram_reserve_frac: float = BIGRAM_RESERVE_FRAC
         self._lbpe_exp: float = 0.0
-        self._min_bigram_freq: int = 8  # tuned: domain 1 & 2 optimal at 8
+        self._min_bigram_freq: int = 8
+        self._strip_handles: bool = False
 
     def _add_token(self, token: str) -> int:
         """Register token, return its id (existing or new)."""
@@ -96,34 +97,45 @@ class BPETokenizer(BaseTokenizer):
         return out
 
     def _auto_configure(self, texts: List[str]) -> str:
-        """Set per-domain hyperparams, return detected mode."""
+        """Set per-domain hyperparams, return detected mode.
+
+        Values hard-coded from Optuna tuning (tuning_results/domain_*_best.json),
+        rounded to 3 decimals. strip_handles was False in every best config.
+        """
         n = len(texts) or 1
         at_frac = sum(1 for t in texts if t.lstrip().startswith("@")) / n
 
+        # Domain 3 (hidden / combined corpus)
         if n > 1400000:
-            self._min_pair_freq = 5
-            self._bigram_reserve_frac = 0.0030
-            self._lbpe_exp = 0.8196
-            self._min_bigram_freq = 18
+            self._min_pair_freq = 8
+            self._bigram_reserve_frac = 0.017
+            self._lbpe_exp = 0.800
+            self._min_bigram_freq = 5
+            self._strip_handles = False
             return "mixed"
+        # Domain 1 (social / Twitter)
         if at_frac > 0.05:
-            self._min_pair_freq = 9
-            self._bigram_reserve_frac = 0.0068
-            self._lbpe_exp = 1.4908
+            self._min_pair_freq = 7
+            self._bigram_reserve_frac = 0.003
+            self._lbpe_exp = 1.108
+            self._min_bigram_freq = 16
+            self._strip_handles = False
             return "social"
         # Domain 2 (formal/news)
-        self._min_pair_freq = 4
-        self._bigram_reserve_frac = 0.0909
-        self._lbpe_exp = 0.7771
+        self._min_pair_freq = 6
+        self._bigram_reserve_frac = 0.008
+        self._lbpe_exp = 0.460
+        self._min_bigram_freq = 1
+        self._strip_handles = False
         return "formal"
 
     def train(self, texts: List[str]) -> None:
         """Learn merges from texts."""
-        mode = self._auto_configure(texts)
+        self._auto_configure(texts)
 
-        # Domain-3: strip @handles before training. ~99.6% are non-entities and
-        # eval domain isn't Twitter, so handle merges waste vocab budget.
-        if mode == "mixed":
+        # Handle-stripping disabled: tuning found strip_handles=False best for
+        # all three domains (tuning_results/domain_*_best.json).
+        if getattr(self, "_strip_handles", False):
             texts = [HANDLE_RE.sub("", t) for t in texts]
 
         # Base vocab: every byte-level char => no OOV.
